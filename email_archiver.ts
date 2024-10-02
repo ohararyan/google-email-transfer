@@ -78,7 +78,7 @@ async function getLabels(gmail: any): Promise<EmailLabel[]> {
   const response: GaxiosResponse = await gmail.users.labels.list({ userId: 'me' });
   return response.data.labels.filter((label: EmailLabel) =>
     !label.name.startsWith('CATEGORY_') &&
-    !['TRASH', 'SPAM'].includes(label.name)
+    !['TRASH', 'SPAM', 'UNREAD', 'STARRED', 'IMPORTANT'].includes(label.name)
   );
 }
 
@@ -135,103 +135,78 @@ interface TransferSummary {
   totalEmailsTransferred: number;
 }
 
-// Modify the transferEmailsForLabel function to return the number of emails transferred
-async function transferEmailsForLabel(sourceGmail: any, destGmail: any, sourceEmail: string, label: EmailLabel, mainLabelId: string, isDryRun: boolean): Promise<number> {
-  const messagesResponse: GaxiosResponse = await sourceGmail.users.messages.list({
-    userId: 'me',
-    labelIds: [label.id],
-  });
-
-  const messages = messagesResponse.data.messages || [];
-  console.log(chalk.cyan(`Found ${chalk.bold(messages.length)} messages for label: ${chalk.bold(label.name)}`));
-
-  if (messages.length === 0) {
-    console.log(chalk.yellow(`Skipping label creation for ${chalk.bold(label.name)} as there are no messages`));
-    return 0;
-  }
-
-  const sublabelName = `${sourceEmail}/${label.name}`;
-  const sublabelId = isDryRun ? `dry-run-sublabel-${label.id}` : await createOrGetLabel(destGmail, sublabelName);
-  console.log(chalk.green(`Using sublabel: ${chalk.bold(sublabelName)}`));
-
-  let emailsTransferred = 0;
-
-  for (const message of messages) {
-    const metadata: GaxiosResponse<EmailMetadata> = await sourceGmail.users.messages.get({
-      userId: 'me',
-      id: message.id,
-      format: 'metadata',
-      metadataHeaders: ['Subject'],
-    });
-
-    const subject = metadata.data.payload?.headers?.find((h: any) => h.name === 'Subject')?.value || 'No Subject';
-    const internalDate = metadata.data.internalDate;
-
-    const emailExists = await checkIfEmailExists(destGmail, subject, internalDate);
-
-    if (emailExists) {
-      console.log(chalk.yellow(`Skipping existing email: ${chalk.italic(subject)}`));
-      continue;
-    }
-
-    if (!isDryRun) {
-      const res: GaxiosResponse = await sourceGmail.users.messages.get({
-        userId: 'me',
-        id: message.id,
-        format: 'raw',
-      });
-
-      const importRes: GaxiosResponse = await destGmail.users.messages.import({
-        userId: 'me',
-        requestBody: { raw: res.data.raw },
-        internalDateSource: 'dateHeader',
-      });
-
-      await destGmail.users.messages.modify({
-        userId: 'me',
-        id: importRes.data.id,
-        requestBody: { addLabelIds: [mainLabelId, sublabelId] },
-      });
-    }
-    console.log(chalk.green(`${isDryRun ? chalk.yellow('[DRY RUN]') + ' Would transfer' : 'Transferred'} message: ${chalk.italic(subject)}`));
-    emailsTransferred++;
-    await delay(100);
-  }
-
-  return emailsTransferred;
+interface EmailWithLabels {
+  id: string;
+  raw: string;
+  labels: string[];
 }
 
-// Modify the transferEmails function to first count emails and prompt for confirmation
+async function resolveLabelName(gmail: any, labelId: string): Promise<string> {
+  try {
+    const response: GaxiosResponse = await gmail.users.labels.get({
+      userId: 'me',
+      id: labelId
+    });
+    return response.data.name;
+  } catch (error) {
+    console.error(`Failed to resolve name for label ID ${labelId}:`, error);
+    return labelId; // Fallback to using the ID if we can't resolve the name
+  }
+}
+
+async function getAllUniqueEmails(gmail: any): Promise<EmailWithLabels[]> {
+  const response: GaxiosResponse = await gmail.users.messages.list({
+    userId: 'me',
+    maxResults: 500 // Adjust as needed
+  });
+
+  const emails: EmailWithLabels[] = [];
+  for (const message of response.data.messages || []) {
+    const fullMessage: GaxiosResponse = await gmail.users.messages.get({
+      userId: 'me',
+      id: message.id,
+      format: 'raw'
+    });
+
+    // Resolve label names
+    const labelNames = await Promise.all(
+      (fullMessage.data.labelIds || []).map(id => resolveLabelName(gmail, id))
+    );
+
+    emails.push({
+      id: message.id,
+      raw: fullMessage.data.raw,
+      labels: labelNames
+    });
+  }
+
+  return emails;
+}
+
 async function transferEmails(sourceGmail: any, destGmail: any, sourceEmail: string, isDryRun: boolean): Promise<TransferSummary> {
-  const sourceLabels = await getLabels(sourceGmail);
-  console.log(chalk.cyan(`Found ${chalk.bold(sourceLabels.length)} labels to process`));
+  console.log(chalk.cyan('Fetching all unique emails...'));
+  const allEmails = await getAllUniqueEmails(sourceGmail);
+  console.log(chalk.yellow(`Total unique emails to be transferred: ${chalk.bold(allEmails.length)}`));
 
-  let totalEmailCount = 0;
-  const emailCounts = new Map<string, number>();
+  // Count emails per label
+  const labelCounts = new Map<string, number>();
+  allEmails.forEach(email => {
+    email.labels.forEach(label => {
+      if (!label.startsWith('CATEGORY_') && !['UNREAD', 'STARRED', 'IMPORTANT'].includes(label)) {
+        labelCounts.set(label, (labelCounts.get(label) || 0) + 1);
+      }
+    });
+  });
 
-  // Count INBOX, SENT, and DRAFT separately
-  for (const specialLabel of ['INBOX', 'SENT', 'DRAFT']) {
-    const count = await countEmailsForLabel(sourceGmail, specialLabel);
-    emailCounts.set(specialLabel, count);
-    totalEmailCount += count;
-    console.log(chalk.cyan(`${specialLabel}: ${chalk.bold(count)} emails`));
-  }
-
-  // Count other labels
-  for (const label of sourceLabels) {
-    if (!['INBOX', 'SENT', 'DRAFT'].includes(label.name)) {
-      const count = await countEmailsForLabel(sourceGmail, label.id);
-      emailCounts.set(label.name, count);
-      console.log(chalk.cyan(`${label.name}: ${chalk.bold(count)} emails`));
-      // We don't add to totalEmailCount here to avoid double-counting
-    }
-  }
-
-  console.log(chalk.yellow(`Total unique emails to be transferred: ${chalk.bold(totalEmailCount)}`));
+  // Output label counts
+  console.log(chalk.cyan('\nEmails per label:'));
+  labelCounts.forEach((count, label) => {
+    console.log(chalk.cyan(`${label}: ${chalk.bold(count)}`));
+  });
 
   const confirmMessage = isDryRun
     ? `Do you want to proceed with the dry run? (y/n): `
-    : `Do you want to proceed with transferring ${totalEmailCount} emails? (y/n): `;
+    : `Do you want to proceed with transferring ${allEmails.length} emails? (y/n): `;
 
   const confirmed = await promptForConfirmation(chalk.yellow(confirmMessage));
 
@@ -246,29 +221,61 @@ async function transferEmails(sourceGmail: any, destGmail: any, sourceEmail: str
   };
 
   const mainLabelId = isDryRun ? 'dry-run-main-label' : await createOrGetLabel(destGmail, sourceEmail);
-  console.log(chalk.green(`Using main label: ${chalk.bold(sourceEmail)}`));
+  console.log(chalk.green(`${isDryRun ? '[DRY RUN] Would use' : 'Using'} main label: ${chalk.bold(sourceEmail)}`));
   summary.labelsCreated.push(sourceEmail);
 
-  // Transfer INBOX, SENT, and DRAFT messages first
-  for (const specialLabel of ['INBOX', 'SENT', 'DRAFT']) {
-    summary.totalEmailsTransferred += await transferEmailsForLabel(sourceGmail, destGmail, sourceEmail, { id: specialLabel, name: specialLabel }, mainLabelId, isDryRun);
-  }
+  const labelMap = new Map<string, string>();
 
-  // Transfer other labels
-  for (const label of sourceLabels) {
-    if (!['INBOX', 'SENT', 'DRAFT'].includes(label.name)) {
-      const emailsTransferred = await transferEmailsForLabel(sourceGmail, destGmail, sourceEmail, label, mainLabelId, isDryRun);
-      if (emailsTransferred > 0) {
-        summary.labelsCreated.push(`${sourceEmail}/${label.name}`);
-        summary.totalEmailsTransferred += emailsTransferred;
+  for (const email of allEmails) {
+    if (!isDryRun) {
+      const importRes: GaxiosResponse = await destGmail.users.messages.import({
+        userId: 'me',
+        requestBody: { raw: email.raw },
+        internalDateSource: 'dateHeader',
+      });
+
+      const labelIds = [mainLabelId];
+      for (const sourceLabel of email.labels) {
+        if (!sourceLabel.startsWith('CATEGORY_') && !['UNREAD', 'STARRED', 'IMPORTANT'].includes(sourceLabel)) {
+          if (!labelMap.has(sourceLabel)) {
+            const destLabelId = await createOrGetLabel(destGmail, `${sourceEmail}/${sourceLabel}`);
+            labelMap.set(sourceLabel, destLabelId);
+            summary.labelsCreated.push(`${sourceEmail}/${sourceLabel}`);
+          }
+          labelIds.push(labelMap.get(sourceLabel)!);
+        }
+      }
+
+      await destGmail.users.messages.modify({
+        userId: 'me',
+        id: importRes.data.id,
+        requestBody: { addLabelIds: labelIds },
+      });
+    } else {
+      // For dry run, simulate label creation
+      for (const sourceLabel of email.labels) {
+        if (!sourceLabel.startsWith('CATEGORY_') && !['UNREAD', 'STARRED', 'IMPORTANT'].includes(sourceLabel)) {
+          if (!labelMap.has(sourceLabel)) {
+            labelMap.set(sourceLabel, `dry-run-label-${sourceLabel}`);
+            summary.labelsCreated.push(`${sourceEmail}/${sourceLabel}`);
+          }
+        }
       }
     }
+    console.log(chalk.green(`${isDryRun ? '[DRY RUN] Would transfer' : 'Transferred'} message: ${email.id}`));
+    summary.totalEmailsTransferred++;
+    await delay(100);
   }
+
+  // Output created labels
+  console.log(chalk.cyan('\nLabels that would be created:'));
+  summary.labelsCreated.forEach(label => {
+    console.log(chalk.cyan(`- ${label}`));
+  });
 
   return summary;
 }
 
-// Modify the main function to handle the case where the user cancels the transfer
 async function main() {
   const sourceEmail = process.env.SOURCE_EMAIL;
   const archiveEmail = process.env.ARCHIVE_EMAIL;
@@ -290,22 +297,32 @@ async function main() {
     const summary = await transferEmails(sourceGmail, archiveGmail, sourceEmail, isDryRun);
 
     console.log(chalk.bgGreen.black('\nTransfer Summary:'));
-    console.log(chalk.green(`Total emails transferred: ${chalk.bold(summary.totalEmailsTransferred)}`));
-    console.log(chalk.green('Labels created:'));
-    summary.labelsCreated.forEach(label => console.log(chalk.green(`- ${label}`)));
+    console.log(chalk.green(`Total emails ${isDryRun ? 'that would be' : ''} transferred: ${chalk.bold(summary.totalEmailsTransferred)}`));
+    if (!isDryRun) {
+      console.log(chalk.green('Labels created:'));
+      summary.labelsCreated.forEach(label => console.log(chalk.green(`- ${label}`)));
+    }
 
     console.log(chalk.bgGreen.black(`\nEmail transfer ${isDryRun ? 'dry run' : 'completed'} successfully.`));
-  } catch (error) {
-    if (error.message === 'Transfer cancelled by user.') {
-      console.log(chalk.yellow('Transfer cancelled by user.'));
+  } catch (error: unknown) {
+    if (error instanceof Error) {
+      if (error.message === 'Transfer cancelled by user.') {
+        console.log(chalk.yellow('Transfer cancelled by user.'));
+      } else {
+        console.error(chalk.bgRed.white('An error occurred:'));
+        console.error(chalk.red(error.message));
+      }
     } else {
-      console.error(chalk.bgRed.white('An error occurred:'));
-      console.error(chalk.red(error.message));
+      console.error(chalk.bgRed.white('An unknown error occurred'));
     }
   }
 }
 
-main().catch(error => {
-  console.error(chalk.bgRed.white('An error occurred:'));
-  console.error(chalk.red(error.message));
+main().catch((error: unknown) => {
+  if (error instanceof Error) {
+    console.error(chalk.bgRed.white('An error occurred:'));
+    console.error(chalk.red(error.message));
+  } else {
+    console.error(chalk.bgRed.white('An unknown error occurred'));
+  }
 });
